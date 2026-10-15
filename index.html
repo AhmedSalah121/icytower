@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Icy Tower</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #0a0a12;
+    font-family: system-ui, -apple-system, sans-serif;
+    touch-action: none;
+  }
+  #wrap {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    max-width: 100%; max-height: 100%;
+    box-shadow: 0 0 40px rgba(0,0,0,0.6);
+  }
+  #touch {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    height: 22%; display: none; pointer-events: none;
+    z-index: 10;
+  }
+  #touch.active { display: flex; }
+  .tbtn {
+    flex: 1; margin: 8px; border-radius: 16px;
+    background: rgba(255,255,255,0.12);
+    border: 2px solid rgba(255,255,255,0.25);
+    pointer-events: auto;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 28px; color: rgba(255,255,255,0.7);
+    user-select: none; -webkit-user-select: none;
+  }
+  .tbtn:active, .tbtn.pressed { background: rgba(255,255,255,0.28); }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="touch">
+  <div class="tbtn" id="btnL">◀</div>
+  <div class="tbtn" id="btnJ">▲</div>
+  <div class="tbtn" id="btnR">▶</div>
+</div>
+<script>
+(() => {
+"use strict";
+
+// ===================== CONFIG =====================
+const CONFIG = {
+  W: 480,
+  H: 720,
+  FIXED_DT: 1 / 60,
+  GRAVITY: 2200,
+  MOVE_ACCEL: 3200,
+  MAX_SPEED: 380,
+  FRICTION: 0.82,
+  AIR_FRICTION: 0.94,
+  JUMP_VEL: 620,
+  JUMP_SPEED_BONUS: 0.55,   // extra jump from horizontal speed
+  WALL_BOUNCE: 0.85,
+  COYOTE_MS: 80,
+  JUMP_BUFFER_MS: 100,
+  PLAYER_W: 28,
+  PLAYER_H: 40,
+  PLATFORM_H: 14,
+  MIN_PLAT_W: 70,
+  MAX_PLAT_W: 220,
+  BASE_GAP_Y: 90,
+  MAX_GAP_Y: 160,
+  REACH_X: 210,             // max horizontal reach per jump
+  CAMERA_DEADZONE: 0.4,     // fraction of screen height
+  AUTO_SCROLL_START: 40,
+  AUTO_SCROLL_MAX: 180,
+  COMBO_WINDOW: 1.5,
+  THEMES: [
+    { name: "Ice",   bg: ["#0b1a2e","#1a3a5c"], plat: "#a8d8f0", edge: "#e8f6ff", particle: "#c0e8ff", accent: "#7ec8e3" },
+    { name: "Cave",  bg: ["#1a120a","#3a2a1a"], plat: "#8b6914", edge: "#c9a84c", particle: "#d4a84b", accent: "#a67c2a" },
+    { name: "Neon",  bg: ["#0a0014","#1a0030"], plat: "#ff2d95", edge: "#ff9de0", particle: "#ff66cc", accent: "#c026ff" },
+    { name: "Space", bg: ["#000010","#0a0a2e"], plat: "#4a90d9", edge: "#a0d0ff", particle: "#80c0ff", accent: "#6080ff" }
+  ]
+};
+
+// ===================== AUDIO =====================
+const AudioSys = {
+  ctx: null,
+  init() {
+    if (this.ctx) return;
+    try {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    } catch (_) {}
+  },
+  play(freq, type, dur, vol = 0.15, slide = 0) {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    const o = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, t);
+    if (slide) o.frequency.linearRampToValueAtTime(freq + slide, t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g); g.connect(this.ctx.destination);
+    o.start(t); o.stop(t + dur);
+  },
+  jump() { this.play(280, "square", 0.12, 0.12, 120); },
+  land() { this.play(120, "triangle", 0.08, 0.1); },
+  combo(n) { this.play(400 + n * 60, "sine", 0.18, 0.14, 200); },
+  gameOver() { this.play(180, "sawtooth", 0.4, 0.12, -120); this.play(90, "triangle", 0.5, 0.1, -40); }
+};
+
+// ===================== INPUT =====================
+const Input = {
+  left: false, right: false, jump: false, jumpPressed: false,
+  pause: false, restart: false,
+  keys: {},
+  touchLeft: false, touchRight: false, touchJump: false,
+  init() {
+    window.addEventListener("keydown", e => {
+      if (["ArrowLeft","ArrowRight","ArrowUp"," ","KeyA","KeyD","KeyP","KeyR"].includes(e.code)) e.preventDefault();
+      this.keys[e.code] = true;
+      if (e.code === "Space" || e.code === "ArrowUp") this.jumpPressed = true;
+      if (e.code === "KeyP") this.pause = true;
+      if (e.code === "KeyR") this.restart = true;
+    });
+    window.addEventListener("keyup", e => { this.keys[e.code] = false; });
+    // Touch
+    const bind = (el, key) => {
+      const on = () => {
+        this[key] = true;
+        if (key === "touchJump") this.jumpPressed = true;
+        el.classList.add("pressed");
+      };
+      const off = () => { this[key] = false; el.classList.remove("pressed"); };
+      el.addEventListener("touchstart", e => { e.preventDefault(); on(); }, { passive: false });
+      el.addEventListener("touchend", off);
+      el.addEventListener("touchcancel", off);
+      el.addEventListener("mousedown", on);
+      el.addEventListener("mouseup", off);
+      el.addEventListener("mouseleave", off);
+    };
+    bind(document.getElementById("btnL"), "touchLeft");
+    bind(document.getElementById("btnR"), "touchRight");
+    bind(document.getElementById("btnJ"), "touchJump");
+    // Show touch on mobile
+    if ("ontouchstart" in window || navigator.maxTouchPoints > 0) {
+      document.getElementById("touch").classList.add("active");
+    }
+  },
+  update() {
+    this.left  = !!(this.keys["ArrowLeft"]  || this.keys["KeyA"] || this.touchLeft);
+    this.right = !!(this.keys["ArrowRight"] || this.keys["KeyD"] || this.touchRight);
+    this.jump  = !!(this.keys["Space"] || this.keys["ArrowUp"] || this.touchJump);
+  },
+  clearFrame() {
+    this.jumpPressed = false;
+    this.pause = false;
+    this.restart = false;
+  }
+};
+
+// ===================== PARTICLES =====================
+const Particles = {
+  list: [],
+  emit(x, y, n, color, speed = 80, life = 0.5, size = 3) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = speed * (0.4 + Math.random() * 0.8);
+      this.list.push({
+        x, y,
+        vx: Math.cos(a) * s,
+        vy: Math.sin(a) * s - 40,
+        life: life * (0.6 + Math.random() * 0.5),
+        maxLife: life,
+        color,
+        size: size * (0.5 + Math.random())
+      });
+    }
+  },
+  dust(x, y, dir) {
+    for (let i = 0; i < 5; i++) {
+      this.list.push({
+        x: x + (Math.random() - 0.5) * 20,
+        y,
+        vx: (Math.random() - 0.5) * 60 - dir * 30,
+        vy: -Math.random() * 40,
+        life: 0.3 + Math.random() * 0.2,
+        maxLife: 0.4,
+        color: "rgba(200,220,240,0.7)",
+        size: 2 + Math.random() * 2
+      });
+    }
+  },
+  spark(x, y, n) {
+    const colors = ["#fff","#ffef80","#ff80c0","#80e0ff"];
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = 120 + Math.random() * 180;
+      this.list.push({
+        x, y,
+        vx: Math.cos(a) * s,
+        vy: Math.sin(a) * s,
+        life: 0.4 + Math.random() * 0.3,
+        maxLife: 0.6,
+        color: colors[i % colors.length],
+        size: 2 + Math.random() * 3
+      });
+    }
+  },
+  ambient(theme, camY, W, H) {
+    if (Math.random() < 0.3) {
+      this.list.push({
+        x: Math.random() * W,
+        y: camY - 20 - Math.random() * 40,
+        vx: (Math.random() - 0.5) * 20,
+        vy: 20 + Math.random() * 40,
+        life: 2 + Math.random() * 2,
+        maxLife: 3,
+        color: theme.particle + "66",
+        size: 1.5 + Math.random() * 2
+      });
+    }
+  },
+  update(dt) {
+    for (let i = this.list.length - 1; i >= 0; i--) {
+      const p = this.list[i];
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 300 * dt;
+      p.life -= dt;
+      if (p.life <= 0) this.list.splice(i, 1);
+    }
+  },
+  draw(ctx, camY) {
+    for (const p of this.list) {
+      const a = Math.max(0, p.life / p.maxLife);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y - camY, p.size * a, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+};
+
+// ===================== PLAYER =====================
+const Player = {
+  x: 0, y: 0, vx: 0, vy: 0,
+  onGround: false,
+  coyote: 0,
+  jumpBuf: 0,
+  facing: 1,
+  state: "idle", // idle, run, jump, fall, land
+  squash: 1,     // y scale
+  stretch: 1,    // x scale
+  landTimer: 0,
+  animT: 0,
+  floor: 0,
+  highestFloor: 0,
+  reset(x, y) {
+    this.x = x; this.y = y;
+    this.vx = 0; this.vy = 0;
+    this.onGround = false;
+    this.coyote = 0;
+    this.jumpBuf = 0;
+    this.facing = 1;
+    this.state = "idle";
+    this.squash = 1;
+    this.stretch = 1;
+    this.landTimer = 0;
+    this.animT = 0;
+    this.floor = 0;
+    this.highestFloor = 0;
+  },
+  update(dt, platforms, walls) {
+    this.animT += dt;
+    // Horizontal
+    let ax = 0;
+    if (Input.left)  { ax = -CONFIG.MOVE_ACCEL; this.facing = -1; }
+    if (Input.right) { ax =  CONFIG.MOVE_ACCEL; this.facing =  1; }
+    this.vx += ax * dt;
+    if (ax === 0) {
+      this.vx *= this.onGround ? CONFIG.FRICTION : CONFIG.AIR_FRICTION;
+      if (Math.abs(this.vx) < 8) this.vx = 0;
+    }
+    this.vx = Math.max(-CONFIG.MAX_SPEED, Math.min(CONFIG.MAX_SPEED, this.vx));
+
+    // Jump buffer / coyote
+    if (Input.jumpPressed) this.jumpBuf = CONFIG.JUMP_BUFFER_MS / 1000;
+    if (this.onGround) this.coyote = CONFIG.COYOTE_MS / 1000;
+    else this.coyote -= dt;
+    this.jumpBuf -= dt;
+
+    if (this.jumpBuf > 0 && this.coyote > 0) {
+      const speedBonus = Math.abs(this.vx) * CONFIG.JUMP_SPEED_BONUS;
+      this.vy = -(CONFIG.JUMP_VEL + speedBonus);
+      this.onGround = false;
+      this.coyote = 0;
+      this.jumpBuf = 0;
+      this.squash = 0.65;
+      this.stretch = 1.35;
+      AudioSys.jump();
+      Particles.dust(this.x + CONFIG.PLAYER_W / 2, this.y + CONFIG.PLAYER_H, this.facing);
+    }
+
+    // Gravity
+    this.vy += CONFIG.GRAVITY * dt;
+    if (this.vy > 1200) this.vy = 1200;
+
+    // Integrate
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+
+    // Wall bounce
+    if (this.x < 0) {
+      this.x = 0;
+      this.vx = Math.abs(this.vx) * CONFIG.WALL_BOUNCE;
+    }
+    if (this.x + CONFIG.PLAYER_W > CONFIG.W) {
+      this.x = CONFIG.W - CONFIG.PLAYER_W;
+      this.vx = -Math.abs(this.vx) * CONFIG.WALL_BOUNCE;
+    }
+
+    // Platform collision (one-way)
+    this.onGround = false;
+    let landed = false;
+    if (this.vy >= 0) {
+      for (const p of platforms) {
+        if (this.x + CONFIG.PLAYER_W > p.x + 2 &&
+            this.x < p.x + p.w - 2 &&
+            this.y + CONFIG.PLAYER_H >= p.y &&
+            this.y + CONFIG.PLAYER_H <= p.y + CONFIG.PLATFORM_H + 12 &&
+            this.y + CONFIG.PLAYER_H - this.vy * dt <= p.y + 2) {
+          this.y = p.y - CONFIG.PLAYER_H;
+          this.vy = 0;
+          this.onGround = true;
+          landed = true;
+          if (p.floor > this.highestFloor) {
+            this.highestFloor = p.floor;
+            this.floor = p.floor;
+          }
+          break;
+        }
+      }
+    }
+
+    // State & juice
+    if (landed && this.landTimer <= 0) {
+      this.landTimer = 0.12;
+      this.squash = 1.35;
+      this.stretch = 0.7;
+      AudioSys.land();
+      Particles.dust(this.x + CONFIG.PLAYER_W / 2, this.y + CONFIG.PLAYER_H, 0);
+    }
+    this.landTimer -= dt;
+
+    // Recover squash/stretch
+    this.squash  += (1 - this.squash)  * Math.min(1, 12 * dt);
+    this.stretch += (1 - this.stretch) * Math.min(1, 12 * dt);
+
+    if (!this.onGround) {
+      this.state = this.vy < 0 ? "jump" : "fall";
+    } else if (Math.abs(this.vx) > 20) {
+      this.state = "run";
+      if (Math.random() < 0.15) Particles.dust(this.x + CONFIG.PLAYER_W / 2, this.y + CONFIG.PLAYER_H, this.facing);
+    } else {
+      this.state = "idle";
+    }
+  },
+  draw(ctx, camY) {
+    const px = this.x + CONFIG.PLAYER_W / 2;
+    const py = this.y + CONFIG.PLAYER_H / 2 - camY;
+    const sw = CONFIG.PLAYER_W * this.stretch;
+    const sh = CONFIG.PLAYER_H * this.squash;
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.scale(this.facing, 1);
+
+    // Body
+    ctx.fillStyle = "#f0e6d0";
+    ctx.beginPath();
+    ctx.roundRect(-sw / 2, -sh / 2, sw, sh * 0.7, 6);
+    ctx.fill();
+
+    // Legs
+    const legOff = this.state === "run" ? Math.sin(this.animT * 14) * 6 : 0;
+    ctx.fillStyle = "#3a5a8a";
+    ctx.fillRect(-sw * 0.3, sh * 0.15, sw * 0.25, sh * 0.4 + legOff);
+    ctx.fillRect( sw * 0.05, sh * 0.15, sw * 0.25, sh * 0.4 - legOff);
+
+    // Scarf
+    ctx.fillStyle = "#e04040";
+    ctx.beginPath();
+    ctx.moveTo(-sw * 0.15, -sh * 0.15);
+    ctx.quadraticCurveTo(-sw * 0.6, -sh * 0.1 + Math.sin(this.animT * 8) * 4, -sw * 0.5, sh * 0.2);
+    ctx.lineTo(-sw * 0.35, sh * 0.25);
+    ctx.quadraticCurveTo(-sw * 0.45, 0, -sw * 0.1, -sh * 0.05);
+    ctx.fill();
+
+    // Hat
+    ctx.fillStyle = "#2a4a7a";
+    ctx.beginPath();
+    ctx.ellipse(0, -sh * 0.42, sw * 0.48, sh * 0.18, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillRect(-sw * 0.28, -sh * 0.7, sw * 0.56, sh * 0.32);
+    ctx.fillStyle = "#e04040";
+    ctx.beginPath();
+    ctx.arc(0, -sh * 0.72, 5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Eyes
+    ctx.fillStyle = "#222";
+    ctx.beginPath();
+    ctx.arc(sw * 0.12, -sh * 0.22, 2.5, 0, Math.PI * 2);
+    ctx.arc(sw * 0.28, -sh * 0.22, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+};
+
+// ===================== LEVEL =====================
+const Level = {
+  platforms: [],
+  nextFloor: 0,
+  highestY: 0,
+  themeIdx: 0,
+  reset() {
+    this.platforms = [];
+    this.nextFloor = 0;
+    this.highestY = CONFIG.H - 80;
+    this.themeIdx = 0;
+    // Starting platform
+    this.platforms.push({ x: 40, y: this.highestY, w: CONFIG.W - 80, floor: 0, milestone: true });
+    this.nextFloor = 1;
+    // Generate initial batch
+    while (this.highestY > -CONFIG.H * 2) this.generate();
+  },
+  theme() { return CONFIG.THEMES[this.themeIdx % CONFIG.THEMES.length]; },
+  generate() {
+    const f = this.nextFloor;
+    this.themeIdx = Math.floor(f / 100);
+    const t = Math.min(1, f / 200);
+    const minW = CONFIG.MIN_PLAT_W + (1 - t) * 40;
+    const maxW = CONFIG.MAX_PLAT_W - t * 80;
+    const gapY = CONFIG.BASE_GAP_Y + t * (CONFIG.MAX_GAP_Y - CONFIG.BASE_GAP_Y);
+    const isMile = f % 10 === 0;
+
+    let w, x;
+    if (isMile) {
+      w = CONFIG.W - 20;
+      x = 10;
+    } else {
+      w = minW + Math.random() * (maxW - minW);
+      // Keep reachable
+      const prev = this.platforms[this.platforms.length - 1];
+      const maxDx = CONFIG.REACH_X * (0.7 + 0.3 * (1 - t));
+      const center = prev.x + prev.w / 2;
+      const minX = Math.max(8, center - maxDx - w / 2);
+      const maxX = Math.min(CONFIG.W - 8 - w, center + maxDx - w / 2);
+      x = minX + Math.random() * Math.max(0, maxX - minX);
+    }
+
+    this.highestY -= gapY * (0.85 + Math.random() * 0.3);
+    this.platforms.push({ x, y: this.highestY, w, floor: f, milestone: isMile });
+    this.nextFloor++;
+  },
+  update(camY) {
+    // Generate above camera
+    while (this.highestY > camY - CONFIG.H * 1.5) this.generate();
+    // Cull below
+    this.platforms = this.platforms.filter(p => p.y < camY + CONFIG.H + 100);
+  },
+  draw(ctx, camY) {
+    const th = this.theme();
+    for (const p of this.platforms) {
+      const sy = p.y - camY;
+      if (sy < -40 || sy > CONFIG.H + 40) continue;
+
+      // Shadow
+      ctx.fillStyle = "rgba(0,0,0,0.25)";
+      ctx.beginPath();
+      ctx.roundRect(p.x + 3, sy + 4, p.w, CONFIG.PLATFORM_H, 4);
+      ctx.fill();
+
+      // Main body
+      const grad = ctx.createLinearGradient(p.x, sy, p.x, sy + CONFIG.PLATFORM_H);
+      grad.addColorStop(0, th.edge);
+      grad.addColorStop(0.4, th.plat);
+      grad.addColorStop(1, shade(th.plat, -30));
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.roundRect(p.x, sy, p.w, CONFIG.PLATFORM_H, 5);
+      ctx.fill();
+
+      // Highlight
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.beginPath();
+      ctx.roundRect(p.x + 4, sy + 2, p.w - 8, 3, 2);
+      ctx.fill();
+
+      // Icicles (ice theme)
+      if (this.themeIdx % 4 === 0 && !p.milestone) {
+        ctx.fillStyle = th.edge;
+        for (let i = 8; i < p.w - 8; i += 14 + (i % 7)) {
+          const h = 6 + (i * 13) % 8;
+          ctx.beginPath();
+          ctx.moveTo(p.x + i, sy + CONFIG.PLATFORM_H);
+          ctx.lineTo(p.x + i + 4, sy + CONFIG.PLATFORM_H + h);
+          ctx.lineTo(p.x + i + 8, sy + CONFIG.PLATFORM_H);
+          ctx.fill();
+        }
+      }
+
+      // Milestone label
+      if (p.milestone) {
+        ctx.fillStyle = "rgba(0,0,0,0.5)";
+        ctx.font = "bold 14px system-ui";
+        ctx.textAlign = "center";
+        ctx.fillText(String(p.floor), p.x + p.w / 2, sy + CONFIG.PLATFORM_H - 2);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(String(p.floor), p.x + p.w / 2, sy + CONFIG.PLATFORM_H - 3);
+      }
+    }
+  }
+};
+
+function shade(hex, amt) {
+  let r = parseInt(hex.slice(1, 3), 16);
+  let g = parseInt(hex.slice(3, 5), 16);
+  let b = parseInt(hex.slice(5, 7), 16);
+  r = Math.max(0, Math.min(255, r + amt));
+  g = Math.max(0, Math.min(255, g + amt));
+  b = Math.max(0, Math.min(255, b + amt));
+  return `rgb(${r},${g},${b})`;
+}
+
+// ===================== CAMERA =====================
+const Camera = {
+  y: 0,
+  shake: 0,
+  shakeMag: 0,
+  autoScroll: 0,
+  started: false,
+  reset() {
+    this.y = 0;
+    this.shake = 0;
+    this.shakeMag = 0;
+    this.autoScroll = 0;
+    this.started = false;
+  },
+  update(dt, playerY) {
+    if (!this.started && playerY < CONFIG.H * 0.55) this.started = true;
+    if (this.started) {
+      this.autoScroll = Math.min(CONFIG.AUTO_SCROLL_MAX,
+        CONFIG.AUTO_SCROLL_START + (Player.highestFloor) * 0.8);
+      this.y -= this.autoScroll * dt;
+    }
+    // Follow player if above deadzone
+    const target = playerY - CONFIG.H * CONFIG.CAMERA_DEADZONE;
+    if (target < this.y) this.y = target;
+
+    if (this.shake > 0) {
+      this.shake -= dt;
+    }
+  },
+  addShake(mag) {
+    this.shake = 0.25;
+    this.shakeMag = mag;
+  },
+  offset() {
+    if (this.shake <= 0) return { x: 0, y: 0 };
+    return {
+      x: (Math.random() - 0.5) * this.shakeMag * 2,
+      y: (Math.random() - 0.5) * this.shakeMag * 2
+    };
+  }
+};
+
+// ===================== GAME =====================
+const Game = {
+  state: "MENU",
+  score: 0,
+  best: 0,
+  combo: 0,
+  comboTimer: 0,
+  comboPop: 0,
+  comboPopText: "",
+  fade: 1,
+  menuT: 0,
+  scoreDisplay: 0,
+  init() {
+    try { this.best = parseInt(localStorage.getItem("icyBest") || "0", 10) || 0; } catch (_) {}
+    Input.init();
+    this.resize();
+    window.addEventListener("resize", () => this.resize());
+    this.loop(0);
+  },
+  resize() {
+    const canvas = document.getElementById("c");
+    const scale = Math.min(window.innerWidth / CONFIG.W, window.innerHeight / CONFIG.H);
+    canvas.width = CONFIG.W;
+    canvas.height = CONFIG.H;
+    canvas.style.width = Math.floor(CONFIG.W * scale) + "px";
+    canvas.style.height = Math.floor(CONFIG.H * scale) + "px";
+  },
+  start() {
+    AudioSys.init();
+    if (AudioSys.ctx && AudioSys.ctx.state === "suspended") AudioSys.ctx.resume();
+    Player.reset(CONFIG.W / 2 - CONFIG.PLAYER_W / 2, CONFIG.H - 120);
+    Level.reset();
+    Camera.reset();
+    Particles.list = [];
+    this.score = 0;
+    this.combo = 0;
+    this.comboTimer = 0;
+    this.comboPop = 0;
+    this.scoreDisplay = 0;
+    this.state = "PLAYING";
+    this.fade = 0;
+  },
+  gameOver() {
+    this.state = "GAMEOVER";
+    AudioSys.gameOver();
+    Camera.addShake(12);
+    if (this.score > this.best) {
+      this.best = this.score;
+      try { localStorage.setItem("icyBest", String(this.best)); } catch (_) {}
+    }
+  },
+  update(dt) {
+    Input.update();
+    this.menuT += dt;
+
+    if (this.state === "MENU") {
+      if (Input.jumpPressed || Input.jump) this.start();
+      Input.clearFrame();
+      return;
+    }
+    if (this.state === "GAMEOVER") {
+      if (Input.jumpPressed || Input.restart) this.start();
+      Input.clearFrame();
+      return;
+    }
+    if (this.state === "PAUSED") {
+      if (Input.pause) this.state = "PLAYING";
+      if (Input.restart) this.start();
+      Input.clearFrame();
+      return;
+    }
+
+    // PLAYING
+    if (Input.pause) { this.state = "PAUSED"; Input.clearFrame(); return; }
+    if (Input.restart) { this.start(); Input.clearFrame(); return; }
+
+    const prevFloor = Player.highestFloor;
+    Player.update(dt, Level.platforms, null);
+    Level.update(Camera.y);
+    Camera.update(dt, Player.y);
+    Particles.ambient(Level.theme(), Camera.y, CONFIG.W, CONFIG.H);
+    Particles.update(dt);
+
+    // Scoring & combo
+    if (Player.highestFloor > prevFloor) {
+      const skipped = Player.highestFloor - prevFloor;
+      this.score += skipped;
+      if (skipped >= 2) {
+        this.combo++;
+        this.comboTimer = CONFIG.COMBO_WINDOW;
+        this.score += this.combo * 2;
+        this.comboPop = 0.8;
+        this.comboPopText = this.combo >= 3 ? `COMBO x${this.combo}!` : `x${this.combo}`;
+        AudioSys.combo(this.combo);
+        Particles.spark(Player.x + CONFIG.PLAYER_W / 2, Player.y + CONFIG.PLAYER_H / 2 - Camera.y + Camera.y, 12 + this.combo * 3);
+        if (skipped >= 3) Camera.addShake(6);
+      } else if (this.comboTimer > 0) {
+        // continue chain window
+        this.comboTimer = CONFIG.COMBO_WINDOW;
+      }
+    }
+    if (this.comboTimer > 0) {
+      this.comboTimer -= dt;
+      if (this.comboTimer <= 0) this.combo = 0;
+    }
+    this.comboPop = Math.max(0, this.comboPop - dt);
+
+    // Animated score
+    this.scoreDisplay += (this.score - this.scoreDisplay) * Math.min(1, 8 * dt);
+
+    // Game over
+    if (Player.y - Camera.y > CONFIG.H + 40) {
+      this.gameOver();
+    }
+
+    Input.clearFrame();
+  },
+  draw() {
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d");
+    const th = Level.theme();
+    const off = Camera.offset();
+
+    ctx.save();
+    ctx.translate(off.x, off.y);
+
+    // Background gradient
+    const bg = ctx.createLinearGradient(0, 0, 0, CONFIG.H);
+    bg.addColorStop(0, th.bg[0]);
+    bg.addColorStop(1, th.bg[1]);
+    ctx.fillStyle = bg;
+    ctx.fillRect(-10, -10, CONFIG.W + 20, CONFIG.H + 20);
+
+    // Parallax layers
+    this.drawParallax(ctx, th);
+
+    // Platforms
+    Level.draw(ctx, Camera.y);
+
+    // Particles
+    Particles.draw(ctx, Camera.y);
+
+    // Player
+    if (this.state !== "MENU") Player.draw(ctx, Camera.y);
+
+    ctx.restore();
+
+    // UI
+    this.drawUI(ctx);
+  },
+  drawParallax(ctx, th) {
+    const cam = Camera.y;
+    // Far layer - soft circles
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = th.accent;
+    for (let i = 0; i < 8; i++) {
+      const seed = i * 9973;
+      const x = ((seed * 13) % CONFIG.W);
+      const y = ((cam * 0.15 + seed * 47) % (CONFIG.H + 200)) - 100;
+      const r = 30 + (seed % 40);
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Near layer
+    ctx.globalAlpha = 0.08;
+    for (let i = 0; i < 5; i++) {
+      const seed = i * 7919;
+      const x = ((seed * 17) % CONFIG.W);
+      const y = ((cam * 0.35 + seed * 31) % (CONFIG.H + 300)) - 150;
+      const r = 50 + (seed % 60);
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // Subtle grid / stars for space
+    if (Level.themeIdx % 4 === 3) {
+      ctx.fillStyle = "#fff";
+      for (let i = 0; i < 40; i++) {
+        const sx = (i * 97) % CONFIG.W;
+        const sy = ((cam * 0.5 + i * 53) % CONFIG.H);
+        ctx.globalAlpha = 0.3 + (i % 5) * 0.1;
+        ctx.fillRect(sx, sy, 1.5, 1.5);
+      }
+      ctx.globalAlpha = 1;
+    }
+  },
+  drawUI(ctx) {
+    if (this.state === "MENU") {
+      ctx.fillStyle = "rgba(0,0,0,0.45)";
+      ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+      const pulse = 0.85 + Math.sin(this.menuT * 3) * 0.15;
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, this.menuT * 1.5);
+      ctx.fillStyle = "#e8f4ff";
+      ctx.font = "bold 48px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText("ICY TOWER", CONFIG.W / 2, CONFIG.H * 0.32);
+      ctx.font = "18px system-ui";
+      ctx.fillStyle = "#a0c8e8";
+      ctx.fillText("Climb forever", CONFIG.W / 2, CONFIG.H * 0.38);
+      ctx.globalAlpha = pulse;
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 20px system-ui";
+      ctx.fillText("Press SPACE / TAP to start", CONFIG.W / 2, CONFIG.H * 0.55);
+      ctx.globalAlpha = 1;
+      ctx.font = "14px system-ui";
+      ctx.fillStyle = "#80a0c0";
+      ctx.fillText("← → / A D  move   SPACE jump", CONFIG.W / 2, CONFIG.H * 0.68);
+      ctx.fillText("P pause   R restart", CONFIG.W / 2, CONFIG.H * 0.72);
+      if (this.best > 0) {
+        ctx.fillStyle = "#ffd070";
+        ctx.fillText("Best: " + this.best, CONFIG.W / 2, CONFIG.H * 0.82);
+      }
+      ctx.restore();
+      return;
+    }
+
+    // Score
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.beginPath();
+    ctx.roundRect(12, 12, 120, 36, 8);
+    ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 22px system-ui";
+    ctx.textAlign = "left";
+    ctx.fillText(String(Math.floor(this.scoreDisplay)), 24, 38);
+
+    // Floor
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.beginPath();
+    ctx.roundRect(CONFIG.W - 100, 12, 88, 36, 8);
+    ctx.fill();
+    ctx.fillStyle = "#c0e0ff";
+    ctx.font = "16px system-ui";
+    ctx.textAlign = "right";
+    ctx.fillText("Fl " + Player.highestFloor, CONFIG.W - 24, 36);
+
+    // Combo meter
+    if (this.combo > 0 && this.comboTimer > 0) {
+      const mw = 100;
+      const mh = 8;
+      const mx = CONFIG.W / 2 - mw / 2;
+      const my = 56;
+      ctx.fillStyle = "rgba(0,0,0,0.4)";
+      ctx.beginPath();
+      ctx.roundRect(mx, my, mw, mh, 4);
+      ctx.fill();
+      ctx.fillStyle = "#ff80c0";
+      ctx.beginPath();
+      ctx.roundRect(mx, my, mw * (this.comboTimer / CONFIG.COMBO_WINDOW), mh, 4);
+      ctx.fill();
+    }
+
+    // Combo popup
+    if (this.comboPop > 0) {
+      const s = 1 + (0.8 - this.comboPop) * 0.5;
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, this.comboPop * 2);
+      ctx.translate(CONFIG.W / 2, CONFIG.H * 0.28);
+      ctx.scale(s, s);
+      ctx.fillStyle = "#ffef60";
+      ctx.font = "bold 28px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText(this.comboPopText, 0, 0);
+      ctx.restore();
+    }
+
+    if (this.state === "PAUSED") {
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 36px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText("PAUSED", CONFIG.W / 2, CONFIG.H * 0.45);
+      ctx.font = "16px system-ui";
+      ctx.fillStyle = "#aaa";
+      ctx.fillText("P to resume  ·  R to restart", CONFIG.W / 2, CONFIG.H * 0.52);
+    }
+
+    if (this.state === "GAMEOVER") {
+      ctx.fillStyle = "rgba(0,0,0,0.6)";
+      ctx.fillRect(0, 0, CONFIG.W, CONFIG.H);
+      ctx.fillStyle = "#ff6060";
+      ctx.font = "bold 40px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText("GAME OVER", CONFIG.W / 2, CONFIG.H * 0.35);
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 28px system-ui";
+      ctx.fillText("Score  " + this.score, CONFIG.W / 2, CONFIG.H * 0.46);
+      ctx.fillStyle = "#ffd070";
+      ctx.font = "18px system-ui";
+      ctx.fillText("Best  " + this.best, CONFIG.W / 2, CONFIG.H * 0.53);
+      ctx.fillStyle = "#aaa";
+      ctx.font = "16px system-ui";
+      ctx.fillText("SPACE / TAP to retry", CONFIG.W / 2, CONFIG.H * 0.64);
+    }
+  },
+  // Fixed timestep loop
+  acc: 0,
+  last: 0,
+  loop(ts) {
+    if (!this.last) this.last = ts;
+    let dt = (ts - this.last) / 1000;
+    this.last = ts;
+    if (dt > 0.1) dt = 0.1;
+    this.acc += dt;
+    while (this.acc >= CONFIG.FIXED_DT) {
+      this.update(CONFIG.FIXED_DT);
+      this.acc -= CONFIG.FIXED_DT;
+    }
+    this.draw();
+    requestAnimationFrame(t => this.loop(t));
+  }
+};
+
+// Boot
+Game.init();
+})();
+</script>
+</body>
+</html>
